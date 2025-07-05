@@ -4,7 +4,6 @@ import pandas as pd
 import xarray as xr
 import intake
 import matplotlib.pyplot as plt
-import io
 
 # Optional: for interactive maps, install streamlit-folium and folium
 try:
@@ -15,11 +14,67 @@ except ImportError:
     FOLIUM_AVAILABLE = False
 
 CATALOG_URL = "https://storage.googleapis.com/cmip6/pangeo-cmip6.json"
+
+# Hazard logic lambdas expect xarray Dataset with the relevant variable loaded
 HAZARD_OPTIONS = {
-    "Heatwave": {"variable": "tasmax", "description": "Max temp > 35°C"},
-    "Drought": {"variable": "pr", "description": "Monthly pr < 50mm"},
-    "Precipitation Extreme": {"variable": "pr", "description": "Rain > 30mm/day"},
+    "Heatwave": {
+        "variable": "tasmax",
+        "description": "Max temp > 35°C",
+        "logic": lambda data: ((data["tasmax"] - 273.15) > 35).groupby("time.year").sum()
+    },
+    "Extreme Cold": {
+        "variable": "tasmin",
+        "description": "Min temp < -5°C",
+        "logic": lambda data: ((data["tasmin"] - 273.15) < -5).groupby("time.year").sum()
+    },
+    "Drought": {
+        "variable": "pr",
+        "description": "Monthly pr < 50mm",
+        "logic": lambda data: (
+            (data["pr"] * 86400 * 30).resample(time="1M").sum() < 50
+        ).groupby("time.year").sum()
+    },
+    "Water Stress": {
+        "variable": "pr",
+        "description": "Annual precipitation < 500mm",
+        "logic": lambda data: (
+            (data["pr"] * 86400).resample(time="1Y").sum() < 500
+        ).groupby("time.year").sum()
+    },
+    "Precipitation Extreme": {
+        "variable": "pr",
+        "description": "Rain > 30mm/day",
+        "logic": lambda data: ((data["pr"] * 86400) > 30).groupby("time.year").sum()
+    },
+    "Flooding": {
+        "variable": "pr",
+        "description": "Days with rain > 50mm/day (proxy for pluvial flooding)",
+        "logic": lambda data: ((data["pr"] * 86400) > 50).groupby("time.year").sum()
+    },
+    "Tropical Cyclones": {
+        "variable": "sfcWind",
+        "description": "Days with wind speed > 25 m/s (proxy for cyclonic storms)",
+        "logic": lambda data: ((data["sfcWind"]) > 25).groupby("time.year").sum()
+    },
+    "Wildfires": {
+        "variable": "tasmax_pr",
+        "description": "Days with temp > 32°C and precipitation < 1mm (proxy for fire weather)",
+        "logic": lambda data: (
+            ((data["tasmax"] - 273.15) > 32) & ((data["pr"] * 86400) < 1)
+        ).groupby("time.year").sum()
+    },
+    "Ice Melt": {
+        "variable": "tasmax",
+        "description": "Days with temp > 0°C (proxy for melt conditions)",
+        "logic": lambda data: ((data["tasmax"] - 273.15) > 0).groupby("time.year").sum()
+    },
+    "Sea Level Risk": {
+        "variable": "zos",
+        "description": "Annual mean sea surface height anomaly > 0.2m",
+        "logic": lambda data: (data["zos"].resample(time="1Y").mean() > 0.2).groupby("time.year").sum()
+    },
 }
+
 SCENARIOS = {
     "SSP1-2.6 (Low)": "ssp126",
     "SSP2-4.5 (Intermediate)": "ssp245",
@@ -37,48 +92,95 @@ def get_nearest_grid(ds, lat, lon):
     min_lon = abs_lon.argmin().item()
     return min_lat, min_lon
 
-def load_cmip6_ensemble(variable, scenario, lat, lon, years, n_models=3):
+def load_cmip6_ensemble(hazard, scenario, lat, lon, years, n_models=3):
+    """
+    Load required variables for the hazard (may be >1 for some hazards, e.g. wildfires)
+    """
     cat = get_cmip6_catalog()
     df = cat.df
-    sel = (
-        (df['variable_id'] == variable) &
-        (df['experiment_id'] == scenario) &
-        (df['table_id'].str.contains("day|Amon"))
-    )
-    subset = df[sel].head(n_models)
-    results = []
-    for _, row in subset.iterrows():
-        try:
-            ds = xr.open_zarr(row.zstore, consolidated=True)
-            ds = ds.sel(time=slice(f"{years[0]}-01-01", f"{years[1]}-12-31"))
-            lat_idx, lon_idx = get_nearest_grid(ds, lat, lon)
-            point_data = ds.isel(lat=lat_idx, lon=lon_idx)
-            results.append(point_data)
-        except Exception: continue
-    return results
+    hazard_info = HAZARD_OPTIONS[hazard]
+    if hazard == "Wildfires":
+        # Need both tasmax and pr for fire logic
+        # Get intersection of models that have both
+        tasmax_sel = (
+            (df['variable_id'] == "tasmax")
+            & (df['experiment_id'] == scenario)
+            & (df['table_id'].str.contains("day|Amon"))
+        )
+        pr_sel = (
+            (df['variable_id'] == "pr")
+            & (df['experiment_id'] == scenario)
+            & (df['table_id'].str.contains("day|Amon"))
+        )
+        tasmax_df = df[tasmax_sel].reset_index()
+        pr_df = df[pr_sel].reset_index()
+        # Try to match on source_id and member_id for ensemble
+        merged = pd.merge(
+            tasmax_df, pr_df, on=["source_id", "member_id"], suffixes=('_tasmax', '_pr')
+        )
+        results = []
+        for _, row in merged.head(n_models).iterrows():
+            try:
+                ds_tasmax = xr.open_zarr(row["zstore_tasmax"], consolidated=True)
+                ds_pr = xr.open_zarr(row["zstore_pr"], consolidated=True)
+                ds_tasmax = ds_tasmax.sel(time=slice(f"{years[0]}-01-01", f"{years[1]}-12-31"))
+                ds_pr = ds_pr.sel(time=slice(f"{years[0]}-01-01", f"{years[1]}-12-31"))
+                lat_idx, lon_idx = get_nearest_grid(ds_tasmax, lat, lon)
+                data = {
+                    "tasmax": ds_tasmax.isel(lat=lat_idx, lon=lon_idx)["tasmax"],
+                    "pr": ds_pr.isel(lat=lat_idx, lon=lon_idx)["pr"]
+                }
+                results.append(data)
+            except Exception:
+                continue
+        return results
+    else:
+        variable = hazard_info["variable"]
+        sel = (
+            (df['variable_id'] == variable)
+            & (df['experiment_id'] == scenario)
+            & (df['table_id'].str.contains("day|Amon"))
+        )
+        subset = df[sel].head(n_models)
+        results = []
+        for _, row in subset.iterrows():
+            try:
+                ds = xr.open_zarr(row.zstore, consolidated=True)
+                ds = ds.sel(time=slice(f"{years[0]}-01-01", f"{years[1]}-12-31"))
+                lat_idx, lon_idx = get_nearest_grid(ds, lat, lon)
+                data = {variable: ds.isel(lat=lat_idx, lon=lon_idx)[variable]}
+                # For wildfires logic, also need pr if not already loaded
+                if hazard == "Wildfires" and variable != "pr":
+                    continue
+                results.append(data)
+            except Exception:
+                continue
+        return results
 
 def calculate_hazard_ensemble(hazard, data_list):
+    logic = HAZARD_OPTIONS[hazard]["logic"]
     series_list = []
     for data in data_list:
-        if hazard == "Heatwave":
-            tasmax = data["tasmax"] - 273.15
-            hot_days = (tasmax > 35).groupby("time.year").sum()
-            series_list.append(hot_days)
-        elif hazard == "Drought":
-            pr = data["pr"] * 86400 * 30
-            pr_monthly = pr.resample(time="1M").sum()
-            dry_months = (pr_monthly < 50).groupby("time.year").sum()
-            series_list.append(dry_months)
-        elif hazard == "Precipitation Extreme":
-            pr = data["pr"] * 86400
-            wet_days = (pr > 30).groupby("time.year").sum()
-            series_list.append(wet_days)
-    # Align to years, convert to DataFrame
+        try:
+            # For hazards with multi-variable logic, pass a dict
+            if isinstance(data, dict):
+                ds = xr.Dataset(data)
+                series = logic(ds)
+            else:
+                series = logic(data)
+            series_list.append(series)
+        except Exception as e:
+            continue
+    if not series_list:
+        return pd.DataFrame()
     df = pd.DataFrame({i: s.values for i, s in enumerate(series_list)}, index=series_list[0]["year"].values)
     return df
 
 def plot_ensemble(years, df, hazard_name):
     plt.figure(figsize=(7,3))
+    if df.empty:
+        st.warning("No data available for this hazard at this location/scenario.")
+        return
     mean = df.mean(axis=1)
     std = df.std(axis=1)
     perc10 = df.quantile(0.1, axis=1)
@@ -120,10 +222,24 @@ def actionable_insights(hazard, mean_value, asset, thresholds):
     if hazard == "Drought":
         if mean_value > thresholds["drought_months"]:
             insights.append("Increasing drought: Consider water conservation, alternative sourcing, or crop adaptation.")
-    # Equipment
-    if hazard == "Heatwave" and mean_value > thresholds["equip_temp_limit"]:
-        insights.append("Heat exceeds equipment design: Invest in cooling, maintenance, or heat-resistant equipment.")
-    # Asset value
+    if hazard == "Water Stress":
+        if mean_value > thresholds["water_stress_years"]:
+            insights.append("Significant water stress years: Explore alternative water sources and efficiency measures.")
+    if hazard == "Flooding":
+        if mean_value > thresholds["flood_days"]:
+            insights.append("High risk of pluvial flooding: Consider site drainage improvements and flood insurance.")
+    if hazard == "Tropical Cyclones":
+        if mean_value > thresholds["cyclone_days"]:
+            insights.append("Cyclone risk: Review asset fortification, emergency planning, and insurance.")
+    if hazard == "Wildfires":
+        if mean_value > thresholds["wildfire_days"]:
+            insights.append("Wildfire-prone: Maintain fire breaks, review emergency response, and ensure insurance coverage.")
+    if hazard == "Ice Melt":
+        if mean_value > thresholds["melt_days"]:
+            insights.append("Frequent thaw: Assess infrastructure/foundation adaptation needs.")
+    if hazard == "Sea Level Risk":
+        if mean_value > thresholds["sealvl_years"]:
+            insights.append("Rising sea level: Prepare for flood defenses or relocation.")
     if asset["vulnerability"] > 0.7 and mean_value > 0:
         insights.append("High vulnerability asset at risk: Consider insurance, asset diversification, or relocation.")
     if not insights:
@@ -136,7 +252,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🌍 Advanced Climate Risk & Hazard Modelling Tool")
-st.write("""Multi-asset, multi-hazard, ensemble projections, uncertainty quantification, asset mapping, vulnerability, and actionable insights.""")
+st.write("Multi-asset, multi-hazard, ensemble projections, uncertainty quantification, asset mapping, vulnerability, and actionable insights.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -146,7 +262,11 @@ with col2:
     start_year = st.number_input("Start Year", min_value=2015, max_value=2100, value=2021)
     end_year = st.number_input("End Year", min_value=start_year, max_value=2100, value=2050)
 scenario = st.selectbox("IPCC Scenario", options=list(SCENARIOS.keys()))
-hazards = st.multiselect("Select Hazards", options=list(HAZARD_OPTIONS.keys()), default=["Heatwave"])
+hazards = st.multiselect(
+    "Select Hazards",
+    options=list(HAZARD_OPTIONS.keys()),
+    default=["Heatwave", "Flooding", "Drought", "Extreme Cold", "Precipitation Extreme", "Tropical Cyclones", "Wildfires", "Water Stress", "Ice Melt", "Sea Level Risk"]
+)
 
 # Asset mapping/upload
 st.subheader("Asset Mapping")
@@ -176,6 +296,12 @@ health_monitor_days = st.number_input("Heat monitoring threshold (annual days)",
 equip_temp_limit = st.number_input("Equipment max operating temp (°C)", value=40)
 logistics_days = st.number_input("Heavy rain logistics impact threshold (days/year)", value=10)
 drought_months = st.number_input("Drought impact threshold (months/year)", value=4)
+water_stress_years = st.number_input("Water stress impact threshold (years/period)", value=2)
+flood_days = st.number_input("Flooding days threshold (days/year)", value=3)
+cyclone_days = st.number_input("Cyclone risk days threshold (days/year)", value=1)
+wildfire_days = st.number_input("Wildfire risk days threshold (days/year)", value=5)
+melt_days = st.number_input("Ice melt days threshold (days/year)", value=10)
+sealvl_years = st.number_input("Sea level risk threshold (years/period)", value=2)
 
 thresholds = {
     "heat_risk_days": health_risk_days,
@@ -183,6 +309,12 @@ thresholds = {
     "equip_temp_limit": equip_temp_limit,
     "logistics_days": logistics_days,
     "drought_months": drought_months,
+    "water_stress_years": water_stress_years,
+    "flood_days": flood_days,
+    "cyclone_days": cyclone_days,
+    "wildfire_days": wildfire_days,
+    "melt_days": melt_days,
+    "sealvl_years": sealvl_years,
 }
 
 if st.button("Run Multi-Asset Analysis"):
@@ -195,7 +327,7 @@ if st.button("Run Multi-Asset Analysis"):
             st.markdown(f"**{hazard}: {HAZARD_OPTIONS[hazard]['description']}**")
             st.info("Loading ensemble data...")
             ens = load_cmip6_ensemble(
-                HAZARD_OPTIONS[hazard]["variable"],
+                hazard,
                 scenario_code,
                 asset["lat"],
                 asset["lon"],
@@ -219,18 +351,7 @@ if st.button("Run Multi-Asset Analysis"):
                     "Frequency": mean_hazard,
                     "Productivity Loss %": annual_loss,
                 }))
-            elif hazard == "Precipitation Extreme":
-                st.write("**Estimated annual logistics impact (days with heavy rain):**")
-                st.dataframe(pd.DataFrame({"Year": hz_df.index, "Logistics Impact Days": mean_hazard}))
-                asset_results.append(pd.DataFrame({
-                    "Year": hz_df.index,
-                    "Hazard": [hazard]*len(hz_df.index),
-                    "Frequency": mean_hazard,
-                    "Productivity Loss %": [np.nan]*len(hz_df.index),
-                }))
-            elif hazard == "Drought":
-                st.write("**Estimated annual drought months:**")
-                st.dataframe(pd.DataFrame({"Year": hz_df.index, "Drought Months": mean_hazard}))
+            else:
                 asset_results.append(pd.DataFrame({
                     "Year": hz_df.index,
                     "Hazard": [hazard]*len(hz_df.index),
