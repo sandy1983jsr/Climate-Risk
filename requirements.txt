@@ -6,6 +6,5 @@ matplotlib
 numpy
 pandas
 gcsfs
-# Optional for map-based asset viewer:
-streamlit-folium
-folium
+folium           # for map support (optional but recommended)
+streamlit-folium # for map support (optional but recommended)
