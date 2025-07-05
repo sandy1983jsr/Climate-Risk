@@ -5,7 +5,6 @@ import xarray as xr
 import intake
 import matplotlib.pyplot as plt
 
-# Optional: for interactive maps, install streamlit-folium and folium
 try:
     import folium
     from streamlit_folium import st_folium
@@ -15,7 +14,6 @@ except ImportError:
 
 CATALOG_URL = "https://storage.googleapis.com/cmip6/pangeo-cmip6.json"
 
-# Hazard logic lambdas expect xarray Dataset with the relevant variable loaded
 HAZARD_OPTIONS = {
     "Heatwave": {
         "variable": "tasmax",
@@ -93,15 +91,10 @@ def get_nearest_grid(ds, lat, lon):
     return min_lat, min_lon
 
 def load_cmip6_ensemble(hazard, scenario, lat, lon, years, n_models=3):
-    """
-    Load required variables for the hazard (may be >1 for some hazards, e.g. wildfires)
-    """
     cat = get_cmip6_catalog()
     df = cat.df
     hazard_info = HAZARD_OPTIONS[hazard]
     if hazard == "Wildfires":
-        # Need both tasmax and pr for fire logic
-        # Get intersection of models that have both
         tasmax_sel = (
             (df['variable_id'] == "tasmax")
             & (df['experiment_id'] == scenario)
@@ -114,7 +107,6 @@ def load_cmip6_ensemble(hazard, scenario, lat, lon, years, n_models=3):
         )
         tasmax_df = df[tasmax_sel].reset_index()
         pr_df = df[pr_sel].reset_index()
-        # Try to match on source_id and member_id for ensemble
         merged = pd.merge(
             tasmax_df, pr_df, on=["source_id", "member_id"], suffixes=('_tasmax', '_pr')
         )
@@ -149,9 +141,6 @@ def load_cmip6_ensemble(hazard, scenario, lat, lon, years, n_models=3):
                 ds = ds.sel(time=slice(f"{years[0]}-01-01", f"{years[1]}-12-31"))
                 lat_idx, lon_idx = get_nearest_grid(ds, lat, lon)
                 data = {variable: ds.isel(lat=lat_idx, lon=lon_idx)[variable]}
-                # For wildfires logic, also need pr if not already loaded
-                if hazard == "Wildfires" and variable != "pr":
-                    continue
                 results.append(data)
             except Exception:
                 continue
@@ -162,14 +151,13 @@ def calculate_hazard_ensemble(hazard, data_list):
     series_list = []
     for data in data_list:
         try:
-            # For hazards with multi-variable logic, pass a dict
             if isinstance(data, dict):
                 ds = xr.Dataset(data)
                 series = logic(ds)
             else:
                 series = logic(data)
             series_list.append(series)
-        except Exception as e:
+        except Exception:
             continue
     if not series_list:
         return pd.DataFrame()
@@ -182,7 +170,6 @@ def plot_ensemble(years, df, hazard_name):
         st.warning("No data available for this hazard at this location/scenario.")
         return
     mean = df.mean(axis=1)
-    std = df.std(axis=1)
     perc10 = df.quantile(0.1, axis=1)
     perc90 = df.quantile(0.9, axis=1)
     plt.plot(years, mean, label="Mean", color="navy")
@@ -252,7 +239,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🌍 Advanced Climate Risk & Hazard Modelling Tool")
-st.write("Multi-asset, multi-hazard, ensemble projections, uncertainty quantification, asset mapping, vulnerability, and actionable insights.")
+st.write("Multi-asset, multi-hazard, ensemble projections, uncertainty quantification, asset mapping, vulnerability, actionable insights, and financial impact assessment.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -282,7 +269,6 @@ else:
 if FOLIUM_AVAILABLE:
     asset_map(assets_df)
 
-# Vulnerability
 if not uploaded:
     st.subheader("Vulnerability Mapping")
     vuln = st.slider("Select vulnerability for sample asset", 0.0, 1.0, 0.5, step=0.05)
@@ -317,9 +303,18 @@ thresholds = {
     "sealvl_years": sealvl_years,
 }
 
+st.subheader("Financial Impact Parameters (INR million per event)")
+cost_params = {}
+for hazard in hazards:
+    cost_params[hazard] = st.number_input(
+        f"Financial loss per {hazard} event (INR million)",
+        min_value=0.0, value=10.0, key=f"cost_{hazard}"
+    )
+
 if st.button("Run Multi-Asset Analysis"):
     scenario_code = SCENARIOS[scenario]
     output_tables = []
+    financial_loss_tables = []
     for idx, asset in assets_df.iterrows():
         st.markdown(f"### Asset: **{asset['name']}**  (Vulnerability: {asset['vulnerability']:.2f})")
         asset_results = []
@@ -358,6 +353,18 @@ if st.button("Run Multi-Asset Analysis"):
                     "Frequency": mean_hazard,
                     "Productivity Loss %": [np.nan]*len(hz_df.index),
                 }))
+            # Financial loss calculation
+            annual_fin_loss = mean_hazard * cost_params[hazard] * asset["vulnerability"]
+            fin_table = pd.DataFrame({
+                "Asset": asset["name"],
+                "Hazard": hazard,
+                "Source of Loss": hazard,
+                "Year": hz_df.index,
+                "Annual Frequency": mean_hazard.values,
+                "Loss per Event (INR million)": cost_params[hazard],
+                "Estimated Annual Loss (INR million)": annual_fin_loss.values
+            })
+            financial_loss_tables.append(fin_table)
             # Actionable insights
             insights = actionable_insights(hazard, mean_hazard.mean(), asset, thresholds)
             st.info("**Actionable Insights:**")
@@ -368,8 +375,12 @@ if st.button("Run Multi-Asset Analysis"):
     # Downloadable summary
     if output_tables:
         full_output = pd.concat(output_tables, ignore_index=True)
-        csv = full_output.to_csv(index=False)
-        st.download_button("Download Results as CSV", data=csv, file_name="hazard_assessment_results.csv")
+        st.download_button("Download Results as CSV", data=full_output.to_csv(index=False), file_name="hazard_assessment_results.csv")
+    if financial_loss_tables:
+        loss_df = pd.concat(financial_loss_tables, ignore_index=True)
+        st.subheader("Estimated Financial Losses by Asset and Hazard (INR million)")
+        st.dataframe(loss_df)
+        st.download_button("Download Financial Loss Table as CSV", data=loss_df.to_csv(index=False), file_name="financial_loss_results.csv")
 
 st.markdown("---")
-st.caption("Demo: Multi-asset, multi-hazard, ensemble projection, uncertainty quantification, asset mapping, vulnerability, impact assessment, and actionable insights.")
+st.caption("Demo: Multi-asset, multi-hazard, ensemble projection, uncertainty quantification, asset mapping, vulnerability, impact and actionable insights, and financial loss assessment.")
