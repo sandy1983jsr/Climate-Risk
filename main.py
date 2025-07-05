@@ -24,7 +24,7 @@ SCENARIOS = {
 
 YEARS = (2021, 2050)
 
-@st.cache_data(show_spinner="Loading CMIP6 catalog...")
+@st.cache_data
 def get_cmip6_catalog():
     return intake.open_esm_datastore(CATALOG_URL)
 
@@ -36,44 +36,38 @@ def get_nearest_grid(ds, lat, lon):
     min_lon = abs_lon.argmin().item()
     return min_lat, min_lon
 
-@st.cache_data(show_spinner="Loading climate data...", suppress_st_warning=True)
+@st.cache_data
 def load_cmip6_data(variable, scenario, lat, lon, years=YEARS):
     """Load CMIP6 data for a variable, scenario, and coordinates from the catalog."""
     cat = get_cmip6_catalog()
     df = cat.df
-    # Find matching datasets
     sel = (
         (df['variable_id'] == variable) &
         (df['experiment_id'] == scenario) &
-        (df['table_id'].str.contains("day|Amon"))  # daily or monthly
+        (df['table_id'].str.contains("day|Amon"))
     )
     subset = df[sel]
     if subset.empty:
         return None
     ds_url = subset.iloc[0].zstore
     ds = xr.open_zarr(ds_url, consolidated=True)
-    # Time slice
     ds = ds.sel(time=slice(f"{years[0]}-01-01", f"{years[1]}-12-31"))
-    # Nearest grid point
     lat_idx, lon_idx = get_nearest_grid(ds, lat, lon)
     point_data = ds.isel(lat=lat_idx, lon=lon_idx)
     return point_data
 
 def calculate_hazard(hazard, data):
     if hazard == "Heatwave":
-        # Days with max temp > 35C
-        tasmax = data["tasmax"] - 273.15  # convert K to C
+        tasmax = data["tasmax"] - 273.15  # K to C
         hot_days = (tasmax > 35).groupby("time.year").sum()
         return hot_days
     elif hazard == "Drought":
-        # Months with pr < 50mm (pr is in kg/m2/s, convert to mm/month)
-        pr = data["pr"] * 86400 * 30  # rough monthly sum
+        pr = data["pr"] * 86400 * 30  # kg/m2/s to mm/month
         pr_monthly = pr.resample(time="1M").sum()
         dry_months = (pr_monthly < 50).groupby("time.year").sum()
         return dry_months
     elif hazard == "Precipitation Extreme":
-        # Days with pr > 30mm (pr is in kg/m2/s, convert to mm/day)
-        pr = data["pr"] * 86400  # 1kg/m2/s = 1mm/day
+        pr = data["pr"] * 86400  # kg/m2/s to mm/day
         wet_days = (pr > 30).groupby("time.year").sum()
         return wet_days
     return None
